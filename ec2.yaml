@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CFN Stack for creation of EC2
+
+#############################
+# PARAMETERS                #
+#############################
+Parameters:
+  AppName:
+    Type: String
+    Default: Test
+  Env:
+    Type: String
+    Default: poc
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID
+  SubnetId:
+    Description: Private Subnet for AZ 1
+    Type: AWS::EC2::Subnet::Id
+
+  # Instance Parameters
+  ImageId:
+    Description: AMI to use for the EC2 instance
+    Type: AWS::EC2::Image::Id
+    Default: ami-03253b35e5fed3eb1
+
+  InstanceType:
+    Description: EC2 instance class and type for application server
+    Type: String
+    Default: t3.medium
+
+  SourceCIDR:
+    Type: String
+    Description: The CIDR block of the source
+    Default: 0.0.0.0/0
+
+#############################
+# RESOURCES                 #
+#############################
+Resources:
+  # EC2 Key Pair
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub EC2KeyPair-${AppName}-${Env}
+      Tags:
+        - Key: Name
+          Value: !Sub ec2-keypair-${AppName}-${Env}-EC2KeyPair
+
+  # Create Security Group for operational use
+  OperationsDefaultSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Shared Security Group for operational aspects like patching, AV
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - FromPort: -1
+          ToPort: -1
+          IpProtocol: '-1'
+          Description: 'Egress rule - all traffic is allowed outbound'
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupIngress:
+        - Description: RDP - Remote Desktop Protocol
+          IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref SourceCIDR
+        - Description: ICMP - Ping
+          IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref SourceCIDR
+        - Description: HTTPS
+          FromPort: 443
+          ToPort: 443
+          IpProtocol: tcp
+          CidrIp: !Ref SourceCIDR
+        - Description: HTTP
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+          CidrIp: !Ref SourceCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub sg-${Env}-${AppName}-Operations-SG
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub ${AppName}/${Env}
+      RetentionInDays: 7
+      # KmsKeyId: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/cwlogs'
+
+  # IAM Role for EC2 Instance
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+          - EC2_INSTANCE_DETAILED_MONITORING_ENABLED
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: '*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: '*'
+
+  # IAM Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Create the EC2 instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref EC2KeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref OperationsDefaultSecurityGroup
+      Monitoring: true
+      EbsOptimized: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 100
+            Iops: 3000
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+            Set-NetFirewallProfile -Enabled False;
+
+            Install-WindowsFeature -Name Web-Server -IncludeManagementTools
+            New-Item -Path C:\inetpub\wwwroot\index.html -ItemType File -Force -Value "<h1>Hello World from ${AppName}-${Env} EC2 instance</h1>"
+
+            Write-Host "Userdata script completed."
+          </powershell>
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Env}
+        - Key: LongName
+          Value: !Sub ec2-${Env}-${AppName}
+        - Key: AppName
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Env
+
+#############################
+# OUTPUTS                   #
+#############################
+Outputs:
+  InstanceId:
+    Description: Instance ID of the Anonymizer App Server
+    Value: !Ref EC2Instance
+  PrivateIP:
+    Description: Private IP address of the Anonymizer App Server
+    Value: !GetAtt EC2Instance.PrivateIp
