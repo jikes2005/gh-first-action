@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Hello-world Strands agent on Bedrock AgentCore Runtime (VPC mode)
+
+Parameters:
+  AgentName:
+    Type: String
+    Default: hello_strands_agent
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]{0,47}"
+  ExecutionRoleArn:
+    Type: String
+    Default: ""
+    Description: Leave blank to have the stack create the execution role
+  CodeBucket:
+    Type: String
+  CodeKey:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets in at least two AZs
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Leave blank to have the stack create the security group
+
+Conditions:
+  CreateRole: !Equals [!Ref ExecutionRoleArn, ""]
+  CreateSecurityGroup: !Equals [!Join ["", !Ref SecurityGroupIds], ""]
+
+Resources:
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateSecurityGroup
+    Properties:
+      GroupDescription: !Sub Security group for AgentCore runtime ${AgentName}
+      VpcId: !Ref VpcId
+      # No ingress: AgentCore invokes the agent through its own control path,
+      # not through inbound connections to these network interfaces.
+      SecurityGroupEgress:
+        - Description: HTTPS to Bedrock, CloudWatch, S3 (via NAT or VPC endpoints)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AgentName}-agentcore-sg
+
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: AgentCoreRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockModelInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/*
+                  - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Sid: ReadAgentCode
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucket}/*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
+              - Sid: Observability
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Ref AgentName
+      Description: Strands hello-world agent
+      RoleArn:
+        !If [CreateRole, !GetAtt AgentExecutionRole.Arn, !Ref ExecutionRoleArn]
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3:
+              Bucket: !Ref CodeBucket
+              Prefix: !Ref CodeKey
+          EntryPoint:
+            - hello_agent.py
+          Runtime: PYTHON_3_12
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: !If
+            - CreateSecurityGroup
+            - [!Ref AgentSecurityGroup]
+            - !Ref SecurityGroupIds
+      ProtocolConfiguration: HTTP
+
+Outputs:
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+  AgentRuntimeId:
+    Value: !GetAtt AgentRuntime.AgentRuntimeId
+  ExecutionRoleUsed:
+    Value:
+      !If [CreateRole, !GetAtt AgentExecutionRole.Arn, !Ref ExecutionRoleArn]
+  SecurityGroupUsed:
+    Value:
+      !If [
+        CreateSecurityGroup,
+        !Ref AgentSecurityGroup,
+        !Join [",", !Ref SecurityGroupIds],
+      ]
