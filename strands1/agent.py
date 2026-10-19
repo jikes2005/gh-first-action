@@ -4,11 +4,13 @@ import logging
 
 import requests
 from bedrock_agentcore import BedrockAgentCoreApp
+from strands.models import BedrockModel
 from strands import Agent, tool
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hello_agent")
 
+MODEL_ID = os.environ.get("MODEL_ID", "<your-model-id>")
 app = BedrockAgentCoreApp()
 
 # Settings come from environment variables so you can change them without code edits
@@ -71,8 +73,15 @@ def call_my_api(endpoint: str, query: dict | None = None) -> str:
     except requests.RequestException as e:
         return f"API call failed: {e}"
 
+model = BedrockModel(
+    model_id=MODEL_ID,
+    region_name=os.environ.get("AWS_REGION", "us-east-1"),
+    temperature=0.2,     # lower = more consistent, better for tool use
+    max_tokens=2048,
+)
 
 agent = Agent(
+    model=model,
     system_prompt=(
         "You are a helpful assistant. Use the available tools to get real data "
         "before answering, and base your answer on the tool results. "

@@ -23,6 +23,10 @@ Parameters:
     Type: CommaDelimitedList
     Default: ""
     Description: Leave blank to have the stack create the security group
+  ModelId:
+    Type: String
+    Description: Bedrock model ID or inference profile ID
+    Default: "anthropic.claude-sonnet-4-5-20260807-v1:0"
 
 Conditions:
   CreateRole: !Equals [!Ref ExecutionRoleArn, ""]
@@ -76,6 +80,16 @@ Resources:
                 Resource:
                   - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/*
                   - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Sid: BedRockGuardrails
+                Effect: Allow
+                Action:
+                  - bedrock:GetGuardrail
+                  - bedrock:UpdateGuardrail
+                  - bedrock:ListGuardrails
+                  - bedrock:DeleteGuardrail
+                  - bedrock:CreateGuardrail
+                  - bedrock:CreateGuardrailVersion
+                Resource: "*"
               - Sid: ReadAgentCode
                 Effect: Allow
                 Action: s3:GetObject
@@ -139,6 +153,8 @@ Resources:
             - [!Ref AgentSecurityGroup]
             - !Ref SecurityGroupIds
       ProtocolConfiguration: HTTP
+      EnvironmentVariables:
+        MODEL_ID: !Ref ModelId
 
 Outputs:
   AgentRuntimeArn:
