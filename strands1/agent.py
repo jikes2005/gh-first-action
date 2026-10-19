@@ -1,9 +1,13 @@
 import json
 import os
+import logging
 
 import requests
 from bedrock_agentcore import BedrockAgentCoreApp
 from strands import Agent, tool
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("hello_agent")
 
 app = BedrockAgentCoreApp()
 
@@ -77,12 +81,22 @@ agent = Agent(
     tools=[get_weather, call_my_api],
 )
 
+log.info("Agent loaded with tools: %s", agent.tool_names)
 
 @app.entrypoint
 def invoke(payload):
-    prompt = payload.get("prompt", "Hello!")
+    log.info("Received payload: %s", payload)
+
+    if isinstance(payload, str):
+        prompt = payload
+    else:
+        prompt = (payload.get("prompt") or payload.get("input")
+                  or payload.get("message") or "Hello!")
     result = agent(prompt)
-    return {"result": result.message}
+    tools_used = {name: m.call_count for name, m in result.metrics.tool_metrics.items()}
+    log.info("Tools used: %s", tools_used)
+
+    return {"result": result.message, "tools_used": tools_used, "prompt_seen": prompt}
 
 
 if __name__ == "__main__":
