@@ -90,7 +90,15 @@ Resources:
                   - bedrock:CreateGuardrail
                   - bedrock:CreateGuardrailVersion
                 Resource: "*"
-              - Sid: ReadAgentCode
+              - Sid: BedrockModelDiscovery
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: "*"
+              - Sid: CodeBucketRead
                 Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucket}/*
