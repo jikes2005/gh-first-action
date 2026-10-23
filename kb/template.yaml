@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  PoC - RAG with Amazon Bedrock Knowledge Base over documents in S3, using Amazon S3 Vectors
-  as the vector store. Deploys into an existing VPC that already has Bedrock VPC endpoints.
-  S3 -> EventBridge -> SQS -> Sync Lambda -> KB ingestion -> S3 Vectors.
+  PoC - RAG with Amazon Bedrock Knowledge Base over documents in S3. Vector store is selectable:
+  Aurora PostgreSQL Serverless v2 + pgvector (default, hybrid search) or Amazon S3 Vectors.
+  Deploys into an existing VPC that already has Bedrock VPC endpoints.
+  S3 -> EventBridge -> SQS -> Sync Lambda -> KB ingestion -> vector store.
   Query Lambda uses Retrieve / RetrieveAndGenerate with a Bedrock model.
 
 Parameters:
@@ -17,6 +18,34 @@ Parameters:
     Default: kb/
     Description: S3 prefix that the Knowledge Base ingests (must end with /).
 
+  # ----- Vector store -----
+  VectorStore:
+    Type: String
+    Default: PGVECTOR
+    AllowedValues: [PGVECTOR, S3_VECTORS]
+    Description: >
+      PGVECTOR = Aurora PostgreSQL Serverless v2 with pgvector in your VPC (primary flow, hybrid search).
+      S3_VECTORS = Amazon S3 Vectors (lowest cost, semantic search only). Changing this replaces the KB.
+
+  AuroraEngineVersion:
+    Type: String
+    Default: "16.6"
+    Description: >
+      Aurora PostgreSQL version (16.1+ / 15.4+ for pgvector HNSW + Data API). Check availability with:
+      aws rds describe-db-engine-versions --engine aurora-postgresql --query 'DBEngineVersions[].EngineVersion'
+
+  AuroraMinCapacity:
+    Type: Number
+    Default: 0.5
+    AllowedValues: [0.5, 1, 2, 4]
+    Description: Serverless v2 minimum ACUs. 0.5 keeps the DB warm (auto-pause to 0 is avoided - cold starts time out Bedrock calls).
+
+  AuroraMaxCapacity:
+    Type: Number
+    Default: 4
+    AllowedValues: [1, 2, 4, 8, 16, 32]
+    Description: Serverless v2 maximum ACUs.
+
   # ----- Models & chunking -----
   EmbeddingModelId:
     Type: String
@@ -27,7 +56,7 @@ Parameters:
     Type: Number
     Default: 1024
     AllowedValues: [256, 512, 1024]
-    Description: Vector dimensions for Titan Text Embeddings V2 (also the S3 Vectors index dimension).
+    Description: Vector dimensions for Titan Text Embeddings V2 (also the pgvector column / S3 Vectors index dimension).
 
   GenerationModelId:
     Type: String
@@ -80,11 +109,36 @@ Metadata:
         Parameters: [ProjectName, DocsPrefix]
       - Label: { default: Networking (existing VPC and Bedrock endpoints) }
         Parameters: [VpcId, SubnetIds, BedrockEndpointSecurityGroupId]
+      - Label: { default: Vector store }
+        Parameters: [VectorStore, AuroraEngineVersion, AuroraMinCapacity, AuroraMaxCapacity]
       - Label: { default: Models & chunking }
         Parameters: [EmbeddingModelId, EmbeddingDimensions, GenerationModelId, ChunkMaxTokens, ChunkOverlapPercentage, SyncBatchWindowSeconds]
 
+Rules:
+  # Fail fast (before any resource is created) if a subnet is not in the chosen VPC.
+  SubnetsMustBelongToVpc:
+    Assertions:
+      - Assert: !EachMemberEquals [!ValueOfAll ["AWS::EC2::Subnet::Id", VpcId], !Ref VpcId]
+        AssertDescription: >-
+          All SubnetIds must belong to the VPC given in VpcId. Check with:
+          aws ec2 describe-subnets --subnet-ids <ids> --query 'Subnets[].[SubnetId,VpcId]'
+
 Conditions:
   AddBedrockEndpointIngress: !Not [!Equals [!Ref BedrockEndpointSecurityGroupId, ""]]
+  UsePgVector: !Equals [!Ref VectorStore, PGVECTOR]
+  UseS3Vectors: !Equals [!Ref VectorStore, S3_VECTORS]
+
+Mappings:
+  PgVector:
+    Names:
+      Database: bedrockkb
+      Schema: bedrock_integration
+      Table: bedrock_integration.bedrock_kb
+      PrimaryKeyField: id
+      VectorField: embedding
+      TextField: chunks
+      MetadataField: metadata
+      CustomMetadataField: custom_metadata
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -123,7 +177,7 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      Description: !Sub "${ProjectName} - Bedrock KB PoC (S3, S3 Vectors, KB ingestion, sessions, SQS, Lambda, Logs)"
+      Description: !Sub "${ProjectName} - Bedrock KB PoC (S3, Aurora, Secrets Manager, S3 Vectors, KB ingestion, sessions, SQS, Lambda, Logs)"
       EnableKeyRotation: true
       KeySpec: SYMMETRIC_DEFAULT
       KeyUsage: ENCRYPT_DECRYPT
@@ -247,10 +301,218 @@ Resources:
                 s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt KmsKey.Arn
 
   # ---------------------------------------------------------------------------
-  # Vector store (Amazon S3 Vectors)
+  # Vector store option A (PRIMARY): Aurora PostgreSQL Serverless v2 + pgvector
+  # ---------------------------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: UsePgVector
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} Aurora pgvector (existing private subnets)"
+      SubnetIds: !Ref SubnetIds
+
+  # Bedrock and the schema-init Lambda use the RDS Data API (HTTPS, IAM + Secrets Manager),
+  # so no inbound database access is required. Add ingress later only if apps need direct SQL.
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UsePgVector
+    Properties:
+      GroupDescription: Aurora pgvector cluster - no inbound (accessed via RDS Data API)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: No egress needed
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-aurora-sg" }]
+
+  # Credentials Bedrock uses to read/write vectors (least-privilege DB role, not the master user)
+  BedrockDbSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: UsePgVector
+    Properties:
+      Description: Aurora pgvector credentials used by the Bedrock Knowledge Base
+      KmsKeyId: !GetAtt KmsKey.Arn
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"bedrock_user"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Condition: UsePgVector
+    DeletionPolicy: Delete          # PoC: no final snapshot. Use Snapshot for anything real.
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-pgvector"
+      Engine: aurora-postgresql
+      EngineVersion: !Ref AuroraEngineVersion
+      DatabaseName: !FindInMap [PgVector, Names, Database]
+      MasterUsername: kbadmin
+      ManageMasterUserPassword: true          # master password lives in Secrets Manager (RDS-managed)
+      MasterUserSecret:
+        KmsKeyId: !GetAtt KmsKey.Arn
+      EnableHttpEndpoint: true                # RDS Data API - required by Bedrock KB
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt KmsKey.Arn
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinCapacity
+        MaxCapacity: !Ref AuroraMaxCapacity
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: UsePgVector
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-pgvector-1"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+
+  # Custom resource: create extension, schema, bedrock_user role, table and indexes via the
+  # RDS Data API. Runs outside the VPC (Data API is an HTTPS AWS API), so no NAT is needed.
+  PgSchemaInitRole:
+    Type: AWS::IAM::Role
+    Condition: UsePgVector
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: schema-init
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BatchExecuteStatement]
+                Resource: !GetAtt AuroraCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+                  - !Ref BedrockDbSecret
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !GetAtt KmsKey.Arn
+
+  PgSchemaInitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UsePgVector
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-pg-schema-init"
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  PgSchemaInitFunction:
+    Type: AWS::Lambda::Function
+    Condition: UsePgVector
+    DependsOn: [PgSchemaInitLogGroup, AuroraInstance]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-pg-schema-init"
+      Description: Creates the pgvector schema, bedrock_user role, table and indexes for the Bedrock KB
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt PgSchemaInitRole.Arn
+      KmsKeyArn: !GetAtt KmsKey.Arn
+      Code:
+        ZipFile: |
+          import json, time, boto3, cfnresponse
+          from botocore.exceptions import ClientError
+
+          rds = boto3.client("rds-data")
+          sm = boto3.client("secretsmanager")
+
+          def run(p, sql):
+              # Retry while the Serverless v2 instance is starting / Data API warming up.
+              for attempt in range(30):
+                  try:
+                      return rds.execute_statement(resourceArn=p["ClusterArn"], secretArn=p["MasterSecretArn"],
+                                                   database=p["Database"], sql=sql)
+                  except ClientError as e:
+                      code, msg = e.response["Error"]["Code"], e.response["Error"].get("Message", "")
+                      transient = code in ("DatabaseResumingException", "DatabaseNotFoundException",
+                                           "ServiceUnavailableError", "StatementTimeoutException") or \
+                                  "Communications link failure" in msg or "is resuming" in msg
+                      if not transient:
+                          raise
+                      print(f"transient ({code}): {msg[:200]} - retry {attempt}")
+                      time.sleep(15)
+              raise RuntimeError("Database did not become available via Data API")
+
+          def setup(p):
+              pwd = json.loads(sm.get_secret_value(SecretId=p["BedrockSecretArn"])["SecretString"])["password"]
+              schema, table, dim = p["Schema"], p["Table"], int(p["Dimension"])
+              stmts = [
+                  "CREATE EXTENSION IF NOT EXISTS vector",
+                  f"CREATE SCHEMA IF NOT EXISTS {schema}",
+                  # Create or rotate the least-privilege role Bedrock uses (password from Secrets Manager).
+                  "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='bedrock_user') "
+                  "THEN CREATE ROLE bedrock_user LOGIN; END IF; END $$",
+                  f"ALTER ROLE bedrock_user WITH LOGIN PASSWORD '{pwd}'",
+                  f"GRANT USAGE, CREATE ON SCHEMA {schema} TO bedrock_user",
+                  f"CREATE TABLE IF NOT EXISTS {table} (id uuid PRIMARY KEY, embedding vector({dim}), "
+                  "chunks text, metadata json, custom_metadata jsonb)",
+                  # HNSW cosine index for semantic search
+                  f"CREATE INDEX IF NOT EXISTS bedrock_kb_embedding_hnsw ON {table} "
+                  "USING hnsw (embedding vector_cosine_ops) WITH (ef_construction = 256)",
+                  # Full-text index on chunks -> enables HYBRID search in Bedrock
+                  f"CREATE INDEX IF NOT EXISTS bedrock_kb_chunks_fts ON {table} "
+                  "USING gin (to_tsvector('simple', chunks))",
+                  # Metadata filtering
+                  f"CREATE INDEX IF NOT EXISTS bedrock_kb_custom_metadata ON {table} USING gin (custom_metadata)",
+                  f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO bedrock_user",
+              ]
+              for sql in stmts:
+                  print("SQL:", sql.split(" PASSWORD ")[0] + (" PASSWORD '***'" if " PASSWORD " in sql else ""))
+                  run(p, sql)
+              ver = run(p, "SELECT extversion FROM pg_extension WHERE extname='vector'")
+              print("pgvector version:", ver["records"][0][0].get("stringValue"))
+
+          def handler(event, context):
+              p = event["ResourceProperties"]
+              phys = f"{p['ClusterArn']}/{p['Table']}"
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      setup(p)
+                  # Delete: no-op - the table goes away with the cluster.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"TableName": p["Table"]}, phys)
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, phys, reason=str(e)[:500])
+
+  PgSchema:
+    Type: Custom::PgVectorSchema
+    Condition: UsePgVector
+    Properties:
+      ServiceToken: !GetAtt PgSchemaInitFunction.Arn
+      ClusterArn: !GetAtt AuroraCluster.DBClusterArn
+      MasterSecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      BedrockSecretArn: !Ref BedrockDbSecret
+      Database: !FindInMap [PgVector, Names, Database]
+      Schema: !FindInMap [PgVector, Names, Schema]
+      Table: !FindInMap [PgVector, Names, Table]
+      Dimension: !Ref EmbeddingDimensions
+
+  # ---------------------------------------------------------------------------
+  # Vector store option B (kept for testing): Amazon S3 Vectors
   # ---------------------------------------------------------------------------
   VectorBucket:
     Type: AWS::S3Vectors::VectorBucket
+    Condition: UseS3Vectors
     Properties:
       VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
       # Immutable after creation; inherited by the index.
@@ -260,6 +522,7 @@ Resources:
 
   VectorIndex:
     Type: AWS::S3Vectors::Index
+    Condition: UseS3Vectors
     DependsOn: VectorBucket
     Properties:
       VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
@@ -316,27 +579,44 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceAccount: !Ref AWS::AccountId
-              # Decrypt SSE-KMS docs, read/write KMS-encrypted vectors, encrypt transient ingestion data
+              # Decrypt SSE-KMS docs + DB secret, read/write KMS-encrypted vectors, encrypt transient ingestion data
               - Sid: KmsForKnowledgeBase
                 Effect: Allow
                 Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
                 Resource: !GetAtt KmsKey.Arn
-              - Sid: VectorStore
-                Effect: Allow
-                Action:
-                  - s3vectors:PutVectors
-                  - s3vectors:GetVectors
-                  - s3vectors:DeleteVectors
-                  - s3vectors:QueryVectors
-                  - s3vectors:ListVectors
-                  - s3vectors:GetIndex
-                Resource: !Ref VectorIndex
+              - !If
+                - UsePgVector
+                - Sid: AuroraDataApi
+                  Effect: Allow
+                  Action: [rds:DescribeDBClusters, rds-data:ExecuteStatement, rds-data:BatchExecuteStatement]
+                  Resource: !GetAtt AuroraCluster.DBClusterArn
+                - !Ref AWS::NoValue
+              - !If
+                - UsePgVector
+                - Sid: AuroraCredentials
+                  Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref BedrockDbSecret
+                - !Ref AWS::NoValue
+              - !If
+                - UseS3Vectors
+                - Sid: S3VectorsStore
+                  Effect: Allow
+                  Action:
+                    - s3vectors:PutVectors
+                    - s3vectors:GetVectors
+                    - s3vectors:DeleteVectors
+                    - s3vectors:QueryVectors
+                    - s3vectors:ListVectors
+                    - s3vectors:GetIndex
+                  Resource: !Ref VectorIndex
+                - !Ref AWS::NoValue
 
   KnowledgeBase:
     Type: AWS::Bedrock::KnowledgeBase
     Properties:
       Name: !Sub "${ProjectName}-kb"
-      Description: PoC knowledge base over S3 documents (S3 Vectors vector store)
+      Description: !Sub "PoC knowledge base over S3 documents (${VectorStore} vector store)"
       RoleArn: !GetAtt KnowledgeBaseRole.Arn
       KnowledgeBaseConfiguration:
         Type: VECTOR
@@ -345,11 +625,24 @@ Resources:
           EmbeddingModelConfiguration:
             BedrockEmbeddingModelConfiguration:
               Dimensions: !Ref EmbeddingDimensions
-      StorageConfiguration:
-        Type: S3_VECTORS
-        S3VectorsConfiguration:
-          VectorBucketArn: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors-${AWS::AccountId}"
-          IndexArn: !Ref VectorIndex
+      StorageConfiguration: !If
+        - UsePgVector
+        - Type: RDS
+          RdsConfiguration:
+            ResourceArn: !GetAtt AuroraCluster.DBClusterArn
+            CredentialsSecretArn: !Ref BedrockDbSecret
+            DatabaseName: !FindInMap [PgVector, Names, Database]
+            TableName: !GetAtt PgSchema.TableName      # also makes the KB wait for schema init
+            FieldMapping:
+              PrimaryKeyField: !FindInMap [PgVector, Names, PrimaryKeyField]
+              VectorField: !FindInMap [PgVector, Names, VectorField]
+              TextField: !FindInMap [PgVector, Names, TextField]
+              MetadataField: !FindInMap [PgVector, Names, MetadataField]
+              CustomMetadataField: !FindInMap [PgVector, Names, CustomMetadataField]
+        - Type: S3_VECTORS
+          S3VectorsConfiguration:
+            VectorBucketArn: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors-${AWS::AccountId}"
+            IndexArn: !Ref VectorIndex
 
   DocsDataSource:
     Type: AWS::Bedrock::DataSource
@@ -542,8 +835,7 @@ Resources:
       FunctionName: !Ref SyncFunction
       BatchSize: 1000
       MaximumBatchingWindowInSeconds: !Ref SyncBatchWindowSeconds
-      ScalingConfig:
-        MaximumConcurrency: 2
+      # Concurrency is capped by ReservedConcurrentExecutions: 1 on SyncFunction.
 
   # ---------------------------------------------------------------------------
   # Query function (RAG)
@@ -608,6 +900,8 @@ Resources:
           MODEL_ID: !Ref GenerationModelId
           ACCOUNT_ID: !Ref AWS::AccountId
           SESSION_KMS_KEY_ARN: !GetAtt KmsKey.Arn
+          # pgvector supports HYBRID (thanks to the full-text index); S3 Vectors is semantic only.
+          DEFAULT_SEARCH_TYPE: !If [UsePgVector, HYBRID, SEMANTIC]
       Code:
         ZipFile: |
           import os, json, re, boto3
@@ -634,8 +928,11 @@ Resources:
                   event = json.loads(event["body"])
               q = event["question"]
               mode = event.get("mode", "rag")                     # "rag" | "retrieve"
-              # S3 Vectors supports semantic search only (no HYBRID).
-              vcfg = {"numberOfResults": int(event.get("numberOfResults", 5))}
+              vcfg = {
+                  "numberOfResults": int(event.get("numberOfResults", 5)),
+                  # HYBRID (pgvector default) | SEMANTIC. S3 Vectors only supports SEMANTIC.
+                  "overrideSearchType": event.get("searchType", os.environ["DEFAULT_SEARCH_TYPE"]),
+              }
               if event.get("filter"):                             # Bedrock RetrievalFilter JSON
                   vcfg["filter"] = event["filter"]
 
@@ -698,7 +995,20 @@ Outputs:
     Value: !Ref QueryFunction
   SyncFunctionName:
     Value: !Ref SyncFunction
+  VectorStore:
+    Value: !Ref VectorStore
+  AuroraClusterArn:
+    Condition: UsePgVector
+    Value: !GetAtt AuroraCluster.DBClusterArn
+  AuroraMasterSecretArn:
+    Condition: UsePgVector
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+    Description: Use with the RDS Query Editor / Data API to inspect the bedrock_kb table
+  BedrockDbSecretArn:
+    Condition: UsePgVector
+    Value: !Ref BedrockDbSecret
   VectorIndexArn:
+    Condition: UseS3Vectors
     Value: !Ref VectorIndex
   KmsKeyArn:
     Value: !GetAtt KmsKey.Arn
