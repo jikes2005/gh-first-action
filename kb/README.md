@@ -222,7 +222,8 @@ aws s3 cp ./my-docs/ s3://<DocsBucketName>/kb/ --recursive
 |---|---|
 | `AuroraCluster` fails: engine version not available | Pick a supported version with `describe-db-engine-versions` (see prerequisites). |
 | `AuroraCluster` fails: subnet group needs 2 AZs | `SubnetIds` must cover at least two Availability Zones. |
-| `PgSchema` fails | Logs in `/aws/lambda/kb-poc-pg-schema-init`. Possible causes: an SCP blocking `rds-data:*`, a missing KMS permission on the secrets, or pgvector unavailable on the chosen version. |
+| `PgSchema` stuck or fails with "Out of time waiting for Aurora Data API" | The function couldn't reach the database through the Data API for about 14 minutes. Check `/aws/lambda/kb-poc-pg-schema-init` for the repeated error code. Common causes: an SCP or permission boundary blocking `rds-data:*` or `secretsmanager:GetSecretValue`, the Data API not available for the chosen engine version in your region, or the instance not yet available. The custom resource has `ServiceTimeout: 960`, so the stack fails within about 16 minutes instead of hanging for an hour. |
+| `PgSchema` fails (other errors) | Logs in `/aws/lambda/kb-poc-pg-schema-init`. Possible causes: an SCP blocking `rds-data:*`, a missing KMS permission on the secrets, or pgvector unavailable on the chosen version. |
 | `KnowledgeBase` fails with an RDS or Secrets Manager error | The KB role needs `rds-data:*Statement` on the cluster, `secretsmanager:GetSecretValue` on `BedrockDbSecret` and `kms:Decrypt` on the key. All of these are in the template, so check for SCPs or permission boundaries. |
 | Ingestion fails with a permission error on the table | Re-run the stack update; the schema init re-applies grants. Or check the grants with the Query Editor. |
 | Sync or query Lambda times out | The Bedrock VPC endpoint isn't reachable. Check its security group allows 443 from the Lambda subnets and that private DNS is on. |

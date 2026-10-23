@@ -430,33 +430,73 @@ Resources:
       KmsKeyArn: !GetAtt KmsKey.Arn
       Code:
         ZipFile: |
-          import json, time, boto3, cfnresponse
+          import json, time, threading, urllib.request
+          import boto3
+          from botocore.config import Config
           from botocore.exceptions import ClientError
 
-          rds = boto3.client("rds-data")
-          sm = boto3.client("secretsmanager")
+          SUCCESS, FAILED = "SUCCESS", "FAILED"
 
-          def run(p, sql):
-              # Retry while the Serverless v2 instance is starting / Data API warming up.
-              for attempt in range(30):
+          def send_cfn_response(event, context, status, data, physical_id, reason=None):
+              """Minimal replacement for cfnresponse (no external module needed)."""
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Logs: {context.log_group_name} / {context.log_stream_name}",
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              for attempt in range(5):
+                  try:
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          print(f"CloudFormation response sent: {status} (HTTP {r.status})")
+                          return
+                  except Exception as e:
+                      print(f"Failed to send CloudFormation response (attempt {attempt}): {e}")
+                      time.sleep(2)
+
+          # Fail fast on hung calls instead of letting the Lambda time out silently.
+          CFG = Config(connect_timeout=5, read_timeout=50, retries={"max_attempts": 2, "mode": "standard"})
+          rds = boto3.client("rds-data", config=CFG)
+          sm = boto3.client("secretsmanager", config=CFG)
+
+          TRANSIENT_CODES = {"DatabaseResumingException", "DatabaseNotFoundException",
+                             "DatabaseUnavailableException", "ServiceUnavailableError",
+                             "StatementTimeoutException", "InternalServerErrorException"}
+
+          class Deadline(Exception):
+              pass
+
+          def run(p, sql, ctx):
+              attempt = 0
+              while True:
+                  if ctx.get_remaining_time_in_millis() < 90_000:
+                      raise Deadline("Out of time waiting for Aurora Data API (see earlier log lines)")
                   try:
                       return rds.execute_statement(resourceArn=p["ClusterArn"], secretArn=p["MasterSecretArn"],
                                                    database=p["Database"], sql=sql)
                   except ClientError as e:
                       code, msg = e.response["Error"]["Code"], e.response["Error"].get("Message", "")
-                      transient = code in ("DatabaseResumingException", "DatabaseNotFoundException",
-                                           "ServiceUnavailableError", "StatementTimeoutException") or \
-                                  "Communications link failure" in msg or "is resuming" in msg
+                      transient = code in TRANSIENT_CODES or "Communications link failure" in msg \
+                                  or "resuming" in msg.lower()
+                      print(f"Data API error ({code}): {msg[:300]} | transient={transient} attempt={attempt}")
                       if not transient:
                           raise
-                      print(f"transient ({code}): {msg[:200]} - retry {attempt}")
-                      time.sleep(15)
-              raise RuntimeError("Database did not become available via Data API")
+                  except Exception as e:   # read/connect timeouts etc.
+                      print(f"Data API call failed: {type(e).__name__}: {e} | attempt={attempt}")
+                  attempt += 1
+                  time.sleep(15)
 
-          def setup(p):
+          def setup(p, ctx):
+              print(f"Connecting to {p['ClusterArn']} database={p['Database']}")
               pwd = json.loads(sm.get_secret_value(SecretId=p["BedrockSecretArn"])["SecretString"])["password"]
               schema, table, dim = p["Schema"], p["Table"], int(p["Dimension"])
               stmts = [
+                  "SELECT 1",   # connectivity check
                   "CREATE EXTENSION IF NOT EXISTS vector",
                   f"CREATE SCHEMA IF NOT EXISTS {schema}",
                   # Create or rotate the least-privilege role Bedrock uses (password from Secrets Manager).
@@ -478,27 +518,44 @@ Resources:
               ]
               for sql in stmts:
                   print("SQL:", sql.split(" PASSWORD ")[0] + (" PASSWORD '***'" if " PASSWORD " in sql else ""))
-                  run(p, sql)
-              ver = run(p, "SELECT extversion FROM pg_extension WHERE extname='vector'")
+                  run(p, sql, ctx)
+              ver = run(p, "SELECT extversion FROM pg_extension WHERE extname='vector'", ctx)
               print("pgvector version:", ver["records"][0][0].get("stringValue"))
 
           def handler(event, context):
               p = event["ResourceProperties"]
               phys = f"{p['ClusterArn']}/{p['Table']}"
+              done = threading.Event()
+
+              def respond(status, data=None, reason=None):
+                  if done.is_set():
+                      return
+                  done.set()
+                  send_cfn_response(event, context, status, data, phys, reason[:500] if reason else None)
+
+              # Safety net: ALWAYS answer CloudFormation before Lambda kills us.
+              guard = threading.Timer(max(context.get_remaining_time_in_millis() / 1000 - 20, 1),
+                                      lambda: respond(FAILED,
+                                                      reason="Timed out - check /aws/lambda/*-pg-schema-init logs"))
+              guard.daemon = True
+              guard.start()
               try:
                   if event["RequestType"] in ("Create", "Update"):
-                      setup(p)
+                      setup(p, context)
                   # Delete: no-op - the table goes away with the cluster.
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"TableName": p["Table"]}, phys)
+                  respond(SUCCESS, {"TableName": p["Table"]})
               except Exception as e:
-                  print(f"ERROR: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, phys, reason=str(e)[:500])
+                  print(f"ERROR: {type(e).__name__}: {e}")
+                  respond(FAILED, reason=f"{type(e).__name__}: {e}")
+              finally:
+                  guard.cancel()
 
   PgSchema:
     Type: Custom::PgVectorSchema
     Condition: UsePgVector
     Properties:
       ServiceToken: !GetAtt PgSchemaInitFunction.Arn
+      ServiceTimeout: 960      # fail the stack after 16 min instead of CloudFormation's 1-hour default
       ClusterArn: !GetAtt AuroraCluster.DBClusterArn
       MasterSecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
       BedrockSecretArn: !Ref BedrockDbSecret
