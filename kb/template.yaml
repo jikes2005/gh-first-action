@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  PoC - RAG with Amazon Bedrock Knowledge Base over documents in S3, using a private
-  Amazon OpenSearch Serverless (AOSS) vector collection. Deploys into an existing VPC that
-  already has Bedrock VPC endpoints. S3 -> EventBridge -> SQS -> Sync Lambda -> KB ingestion
-  -> AOSS. Query Lambda uses Retrieve / RetrieveAndGenerate (hybrid search) with a Bedrock model.
+  PoC - RAG with Amazon Bedrock Knowledge Base over documents in S3, using Amazon S3 Vectors
+  as the vector store. Deploys into an existing VPC that already has Bedrock VPC endpoints.
+  S3 -> EventBridge -> SQS -> Sync Lambda -> KB ingestion -> S3 Vectors.
+  Query Lambda uses Retrieve / RetrieveAndGenerate with a Bedrock model.
 
 Parameters:
   ProjectName:
@@ -27,7 +27,7 @@ Parameters:
     Type: Number
     Default: 1024
     AllowedValues: [256, 512, 1024]
-    Description: Vector dimensions for Titan Text Embeddings V2 (also the AOSS knn_vector dimension).
+    Description: Vector dimensions for Titan Text Embeddings V2 (also the S3 Vectors index dimension).
 
   GenerationModelId:
     Type: String
@@ -55,21 +55,6 @@ Parameters:
     MaxValue: 300
     Description: How long S3 change events are batched before an ingestion job is started.
 
-  # ----- OpenSearch Serverless -----
-  AossStandbyReplicas:
-    Type: String
-    Default: DISABLED
-    AllowedValues: [DISABLED, ENABLED]
-    Description: DISABLED = single-AZ, lowest cost (fine for a PoC). ENABLED = multi-AZ for production.
-
-  ExistingAossVpcEndpointId:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^vpce-[0-9a-z]+$"
-    Description: >
-      Optional. ID of an existing OpenSearch Serverless VPC endpoint (vpce-...) in this VPC.
-      Leave empty to create one. Reuse an existing one if the VPC already has an AOSS endpoint.
-
   # ----- Networking (existing VPC + existing Bedrock endpoints) -----
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -95,22 +80,11 @@ Metadata:
         Parameters: [ProjectName, DocsPrefix]
       - Label: { default: Networking (existing VPC and Bedrock endpoints) }
         Parameters: [VpcId, SubnetIds, BedrockEndpointSecurityGroupId]
-      - Label: { default: OpenSearch Serverless }
-        Parameters: [AossStandbyReplicas, ExistingAossVpcEndpointId]
       - Label: { default: Models & chunking }
         Parameters: [EmbeddingModelId, EmbeddingDimensions, GenerationModelId, ChunkMaxTokens, ChunkOverlapPercentage, SyncBatchWindowSeconds]
 
 Conditions:
-  CreateAossVpcEndpoint: !Equals [!Ref ExistingAossVpcEndpointId, ""]
   AddBedrockEndpointIngress: !Not [!Equals [!Ref BedrockEndpointSecurityGroupId, ""]]
-
-Mappings:
-  Aoss:
-    Names:
-      VectorIndex: bedrock-kb-index
-      VectorField: bedrock-knowledge-base-default-vector
-      TextField: AMAZON_BEDROCK_TEXT_CHUNK
-      MetadataField: AMAZON_BEDROCK_METADATA
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -119,7 +93,7 @@ Resources:
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: KB PoC Lambdas - HTTPS egress only (Bedrock + AOSS via VPC endpoints)
+      GroupDescription: KB PoC Lambdas - HTTPS egress only (Bedrock via VPC endpoints)
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: tcp
@@ -140,34 +114,6 @@ Resources:
       ToPort: 443
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: !Sub "HTTPS from ${ProjectName} Lambdas"
-
-  AossEndpointSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Condition: CreateAossVpcEndpoint
-    Properties:
-      GroupDescription: OpenSearch Serverless VPC endpoint - HTTPS from KB PoC Lambdas only
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref LambdaSecurityGroup
-          Description: HTTPS from Lambdas
-      SecurityGroupEgress:
-        - IpProtocol: "-1"
-          CidrIp: 127.0.0.1/32
-          Description: No egress needed
-      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-aoss-endpoint-sg" }]
-
-  # AOSS uses its own endpoint type (not a regular EC2 interface endpoint).
-  AossVpcEndpoint:
-    Type: AWS::OpenSearchServerless::VpcEndpoint
-    Condition: CreateAossVpcEndpoint
-    Properties:
-      Name: !Sub "${ProjectName}-aoss-vpce"
-      VpcId: !Ref VpcId
-      SubnetIds: !Ref SubnetIds
-      SecurityGroupIds: [!Ref AossEndpointSecurityGroup]
 
   # ---------------------------------------------------------------------------
   # Source documents
@@ -213,7 +159,31 @@ Resources:
                 aws:SecureTransport: "false"
 
   # ---------------------------------------------------------------------------
-  # IAM roles that need AOSS data access (referenced by the data access policy)
+  # Vector store (Amazon S3 Vectors)
+  # ---------------------------------------------------------------------------
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    DependsOn: VectorBucket
+    Properties:
+      VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
+      IndexName: !Sub "${ProjectName}-index"
+      DataType: float32
+      Dimension: !Ref EmbeddingDimensions
+      DistanceMetric: cosine
+      # Bedrock stores chunk text + metadata blobs in these keys. They exceed the
+      # filterable-metadata size limit, so they MUST be non-filterable or ingestion fails.
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
+
+  # ---------------------------------------------------------------------------
+  # Knowledge Base
   # ---------------------------------------------------------------------------
   KnowledgeBaseRole:
     Type: AWS::IAM::Role
@@ -256,229 +226,20 @@ Resources:
                     aws:ResourceAccount: !Ref AWS::AccountId
               - Sid: VectorStore
                 Effect: Allow
-                Action: aoss:APIAccessAll
-                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:ListVectors
+                  - s3vectors:GetIndex
+                Resource: !Ref VectorIndex
 
-  IndexCreatorRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-      Policies:
-        - PolicyName: aoss
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: aoss:APIAccessAll
-                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
-
-  # ---------------------------------------------------------------------------
-  # Vector store: private OpenSearch Serverless collection
-  # ---------------------------------------------------------------------------
-  AossEncryptionPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-enc"
-      Type: encryption
-      Policy: !Sub >-
-        {"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"]}],
-         "AWSOwnedKey":true}
-
-  # Private: reachable only through the AOSS VPC endpoint and by the Bedrock service.
-  AossNetworkPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-net"
-      Type: network
-      Policy: !Sub
-        - >-
-          [{"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"]}],
-            "AllowFromPublic":false,
-            "SourceVPCEs":["${VpceId}"],
-            "SourceServices":["bedrock.amazonaws.com"]}]
-        - VpceId: !If [CreateAossVpcEndpoint, !Ref AossVpcEndpoint, !Ref ExistingAossVpcEndpointId]
-
-  AossDataAccessPolicy:
-    Type: AWS::OpenSearchServerless::AccessPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-access"
-      Type: data
-      Policy: !Sub >-
-        [{"Rules":[
-            {"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"],
-             "Permission":["aoss:DescribeCollectionItems","aoss:CreateCollectionItems","aoss:UpdateCollectionItems"]},
-            {"ResourceType":"index","Resource":["index/${ProjectName}-vectors/*"],
-             "Permission":["aoss:CreateIndex","aoss:DescribeIndex","aoss:UpdateIndex","aoss:DeleteIndex",
-                           "aoss:ReadDocument","aoss:WriteDocument"]}],
-          "Principal":["${KnowledgeBaseRole.Arn}","${IndexCreatorRole.Arn}"]}]
-
-  VectorCollection:
-    Type: AWS::OpenSearchServerless::Collection
-    DependsOn: [AossEncryptionPolicy, AossNetworkPolicy]
-    Properties:
-      Name: !Sub "${ProjectName}-vectors"
-      Type: VECTORSEARCH
-      StandbyReplicas: !Ref AossStandbyReplicas
-      Description: Vector store for the Bedrock KB PoC
-
-  # ---------------------------------------------------------------------------
-  # Vector index creation.
-  # A private collection is only reachable from inside the VPC, so the index is created by
-  # an in-VPC Lambda. A small non-VPC provider Lambda invokes it and replies to CloudFormation
-  # (the in-VPC Lambda has no route to CloudFormation's S3 response URL without NAT).
-  # ---------------------------------------------------------------------------
-  IndexCreatorFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-aoss-index-creator"
-      Description: Creates the Bedrock KB vector index in the private AOSS collection (runs in VPC)
-      Runtime: python3.12
-      Handler: index.handler
-      Timeout: 300
-      MemorySize: 256
-      Role: !GetAtt IndexCreatorRole.Arn
-      VpcConfig:
-        SecurityGroupIds: [!Ref LambdaSecurityGroup]
-        SubnetIds: !Ref SubnetIds
-      Code:
-        ZipFile: |
-          import hashlib, json, os, time, urllib.request, urllib.error
-          import boto3
-          from botocore.auth import SigV4Auth
-          from botocore.awsrequest import AWSRequest
-
-          SESSION = boto3.Session()
-          REGION = os.environ["AWS_REGION"]
-
-          def signed(method, url, body=None):
-              data = json.dumps(body).encode() if body is not None else b""
-              req = AWSRequest(method=method, url=url, data=data,
-                               headers={"Content-Type": "application/json",
-                                        "x-amz-content-sha256": hashlib.sha256(data).hexdigest()})
-              SigV4Auth(SESSION.get_credentials(), "aoss", REGION).add_auth(req)
-              r = urllib.request.Request(url, data=data or None, method=method,
-                                         headers=dict(req.headers.items()))
-              try:
-                  with urllib.request.urlopen(r, timeout=30) as resp:
-                      return resp.status, resp.read().decode()
-              except urllib.error.HTTPError as e:
-                  return e.code, e.read().decode()
-
-          def handler(event, context):
-              endpoint, index = event["CollectionEndpoint"].rstrip("/"), event["IndexName"]
-              dim = int(event["Dimension"])
-              body = {
-                  "settings": {"index": {"knn": True, "knn.algo_param.ef_search": 512}},
-                  "mappings": {"properties": {
-                      event["VectorField"]: {
-                          "type": "knn_vector", "dimension": dim,
-                          "method": {"name": "hnsw", "engine": "faiss", "space_type": "l2",
-                                     "parameters": {"ef_construction": 512, "m": 16}}},
-                      event["TextField"]: {"type": "text", "index": True},
-                      event["MetadataField"]: {"type": "text", "index": False},
-                  }},
-              }
-              # Data access + network policies can take a minute or two to propagate.
-              last = None
-              for attempt in range(20):
-                  status, text = signed("PUT", f"{endpoint}/{index}", body)
-                  print(json.dumps({"attempt": attempt, "status": status, "body": text[:500]}))
-                  if status in (200, 201):
-                      return {"created": True}
-                  if status == 400 and "resource_already_exists_exception" in text:
-                      return {"created": False, "exists": True}
-                  last = f"{status}: {text[:300]}"
-                  time.sleep(12)
-              raise RuntimeError(f"Could not create index {index}: {last}")
-
-  IndexProviderRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-      Policies:
-        - PolicyName: invoke-creator
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt IndexCreatorFunction.Arn
-
-  IndexProviderFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-aoss-index-provider"
-      Description: CloudFormation custom resource provider - invokes the in-VPC index creator
-      Runtime: python3.12
-      Handler: index.handler
-      Timeout: 600
-      MemorySize: 128
-      Role: !GetAtt IndexProviderRole.Arn
-      Environment:
-        Variables:
-          CREATOR_FN: !Ref IndexCreatorFunction
-      Code:
-        ZipFile: |
-          import json, os, time, boto3, cfnresponse
-          lam = boto3.client("lambda")
-
-          def handler(event, context):
-              props = event["ResourceProperties"]
-              phys = f"{props['CollectionName']}/{props['IndexName']}"
-              try:
-                  if event["RequestType"] in ("Create", "Update"):
-                      resp = lam.invoke(FunctionName=os.environ["CREATOR_FN"],
-                                        InvocationType="RequestResponse",
-                                        Payload=json.dumps(props).encode())
-                      payload = resp["Payload"].read().decode()
-                      if resp.get("FunctionError"):
-                          raise RuntimeError(payload[:800])
-                      print(payload)
-                      # Give the new index time to become visible before Bedrock validates it.
-                      if json.loads(payload).get("created"):
-                          time.sleep(60)
-                  # Delete: no-op - the index is removed together with the collection.
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"IndexName": props["IndexName"]}, phys)
-              except Exception as e:
-                  print(f"ERROR: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, phys, reason=str(e)[:500])
-
-  VectorIndex:
-    Type: Custom::AossVectorIndex
-    DependsOn: [AossDataAccessPolicy, AossNetworkPolicy]
-    Properties:
-      ServiceToken: !GetAtt IndexProviderFunction.Arn
-      CollectionName: !Ref VectorCollection
-      CollectionEndpoint: !GetAtt VectorCollection.CollectionEndpoint
-      IndexName: !FindInMap [Aoss, Names, VectorIndex]
-      Dimension: !Ref EmbeddingDimensions
-      VectorField: !FindInMap [Aoss, Names, VectorField]
-      TextField: !FindInMap [Aoss, Names, TextField]
-      MetadataField: !FindInMap [Aoss, Names, MetadataField]
-
-  # ---------------------------------------------------------------------------
-  # Knowledge Base
-  # ---------------------------------------------------------------------------
   KnowledgeBase:
     Type: AWS::Bedrock::KnowledgeBase
-    DependsOn: [VectorIndex, AossDataAccessPolicy]
     Properties:
       Name: !Sub "${ProjectName}-kb"
-      Description: PoC knowledge base over S3 documents (OpenSearch Serverless vector store)
+      Description: PoC knowledge base over S3 documents (S3 Vectors vector store)
       RoleArn: !GetAtt KnowledgeBaseRole.Arn
       KnowledgeBaseConfiguration:
         Type: VECTOR
@@ -488,21 +249,17 @@ Resources:
             BedrockEmbeddingModelConfiguration:
               Dimensions: !Ref EmbeddingDimensions
       StorageConfiguration:
-        Type: OPENSEARCH_SERVERLESS
-        OpensearchServerlessConfiguration:
-          CollectionArn: !GetAtt VectorCollection.Arn
-          VectorIndexName: !FindInMap [Aoss, Names, VectorIndex]
-          FieldMapping:
-            VectorField: !FindInMap [Aoss, Names, VectorField]
-            TextField: !FindInMap [Aoss, Names, TextField]
-            MetadataField: !FindInMap [Aoss, Names, MetadataField]
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          VectorBucketArn: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${ProjectName}-vectors-${AWS::AccountId}"
+          IndexArn: !Ref VectorIndex
 
   DocsDataSource:
     Type: AWS::Bedrock::DataSource
     Properties:
       Name: !Sub "${ProjectName}-s3-docs"
       KnowledgeBaseId: !Ref KnowledgeBase
-      DataDeletionPolicy: RETAIN   # collection is deleted with the stack anyway; avoids delete-order failures
+      DataDeletionPolicy: DELETE
       DataSourceConfiguration:
         Type: S3
         S3Configuration:
@@ -761,10 +518,8 @@ Resources:
                   event = json.loads(event["body"])
               q = event["question"]
               mode = event.get("mode", "rag")                     # "rag" | "retrieve"
-              vcfg = {
-                  "numberOfResults": int(event.get("numberOfResults", 5)),
-                  "overrideSearchType": event.get("searchType", "HYBRID"),   # HYBRID | SEMANTIC
-              }
+              # S3 Vectors supports semantic search only (no HYBRID).
+              vcfg = {"numberOfResults": int(event.get("numberOfResults", 5))}
               if event.get("filter"):                             # Bedrock RetrievalFilter JSON
                   vcfg["filter"] = event["filter"]
 
@@ -822,12 +577,8 @@ Outputs:
     Value: !Ref QueryFunction
   SyncFunctionName:
     Value: !Ref SyncFunction
-  CollectionArn:
-    Value: !GetAtt VectorCollection.Arn
-  CollectionEndpoint:
-    Value: !GetAtt VectorCollection.CollectionEndpoint
-  AossVpcEndpointId:
-    Value: !If [CreateAossVpcEndpoint, !Ref AossVpcEndpoint, !Ref ExistingAossVpcEndpointId]
+  VectorIndexArn:
+    Value: !Ref VectorIndex
   LambdaSecurityGroupId:
     Value: !Ref LambdaSecurityGroup
-    Description: Allow HTTPS from this SG on your Bedrock (and existing AOSS) endpoint security groups
+    Description: Allow HTTPS from this SG on your Bedrock endpoint security group
