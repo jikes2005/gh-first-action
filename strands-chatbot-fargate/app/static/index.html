@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strands Chat</title>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --text:#1d2330; --muted:#6b7280; --me:#2563eb; --bot:#eef0f4; --border:#e2e5ea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --panel:#1a1e24; --text:#e6e8eb; --muted:#9aa1ab; --me:#3b82f6; --bot:#262b33; --border:#2c323b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width: 760px; margin: 0 auto; height: 100vh; display: flex; flex-direction: column; padding: 16px; }
+  header { display:flex; justify-content:space-between; align-items:center; padding-bottom: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header button { background:none; border:1px solid var(--border); color:var(--muted); border-radius:8px; padding:6px 10px; cursor:pointer; }
+  #log { flex:1; overflow-y:auto; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width: 80%; padding:10px 14px; border-radius:14px; line-height:1.45; white-space:pre-wrap; word-wrap:break-word; }
+  .me { align-self:flex-end; background:var(--me); color:#fff; border-bottom-right-radius:4px; }
+  .bot { align-self:flex-start; background:var(--bot); border-bottom-left-radius:4px; }
+  .meta { font-size:12px; color:var(--muted); margin-top:4px; }
+  .err { color:#dc2626; }
+  form { display:flex; gap:8px; margin-top:12px; }
+  textarea { flex:1; resize:none; height:48px; padding:12px; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text); font:inherit; }
+  form button { padding:0 18px; border:none; border-radius:10px; background:var(--me); color:#fff; font-weight:600; cursor:pointer; }
+  form button:disabled { opacity:.5; cursor:default; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Strands Chat</h1>
+    <button id="reset" type="button">New chat</button>
+  </header>
+  <div id="log">
+    <div class="msg bot">Hi! I'm a Strands agent. Try asking "What's the weather in Toronto?"</div>
+  </div>
+  <form id="form">
+    <textarea id="input" placeholder="Type a message… (Enter to send, Shift+Enter for new line)" autofocus></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+</div>
+<script>
+  const log = document.getElementById("log");
+  const form = document.getElementById("form");
+  const input = document.getElementById("input");
+  const send = document.getElementById("send");
+  let sessionId = null;
+
+  function add(text, cls, meta) {
+    const div = document.createElement("div");
+    div.className = "msg " + cls;
+    div.textContent = text;
+    if (meta) {
+      const m = document.createElement("div");
+      m.className = "meta";
+      m.textContent = meta;
+      div.appendChild(m);
+    }
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return div;
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = input.value.trim();
+    if (!message) return;
+    add(message, "me");
+    input.value = "";
+    send.disabled = true;
+    const thinking = add("Thinking…", "bot");
+    try {
+      const res = await fetch("api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, session_id: sessionId }),
+      });
+      const data = await res.json();
+      thinking.remove();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      sessionId = data.session_id;
+      const tools = Object.entries(data.tools_used || {}).map(([k, v]) => `${k}×${v}`).join(", ");
+      add(data.reply, "bot", tools ? `Tools used: ${tools}` : "");
+    } catch (err) {
+      thinking.remove();
+      add("Error: " + err.message, "bot err");
+    } finally {
+      send.disabled = false;
+      input.focus();
+    }
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  document.getElementById("reset").addEventListener("click", async () => {
+    if (sessionId) {
+      await fetch("api/reset", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "", session_id: sessionId }) }).catch(() => {});
+    }
+    sessionId = null;
+    log.innerHTML = "";
+    add("New chat started. How can I help?", "bot");
+  });
+</script>
+</body>
+</html>

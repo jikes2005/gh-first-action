@@ -1,0 +1,833 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PoC - RAG with Amazon Bedrock Knowledge Base over documents in S3, using a private
+  Amazon OpenSearch Serverless (AOSS) vector collection. Deploys into an existing VPC that
+  already has Bedrock VPC endpoints. S3 -> EventBridge -> SQS -> Sync Lambda -> KB ingestion
+  -> AOSS. Query Lambda uses Retrieve / RetrieveAndGenerate (hybrid search) with a Bedrock model.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: kb-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,19}$"
+    Description: Lowercase prefix for resource names (3-20 chars, starts with a letter).
+
+  DocsPrefix:
+    Type: String
+    Default: kb/
+    Description: S3 prefix that the Knowledge Base ingests (must end with /).
+
+  # ----- Models & chunking -----
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Bedrock embedding model ID (must be enabled in this account/region).
+
+  EmbeddingDimensions:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024]
+    Description: Vector dimensions for Titan Text Embeddings V2 (also the AOSS knn_vector dimension).
+
+  GenerationModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >
+      Model or cross-region inference profile ID used to generate answers
+      (e.g. us.anthropic..., eu.anthropic..., global.anthropic...). Must be enabled in Bedrock.
+
+  ChunkMaxTokens:
+    Type: Number
+    Default: 400
+    MinValue: 20
+    MaxValue: 8192
+
+  ChunkOverlapPercentage:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    MaxValue: 99
+
+  SyncBatchWindowSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 300
+    Description: How long S3 change events are batched before an ingestion job is started.
+
+  # ----- OpenSearch Serverless -----
+  AossStandbyReplicas:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: DISABLED = single-AZ, lowest cost (fine for a PoC). ENABLED = multi-AZ for production.
+
+  ExistingAossVpcEndpointId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^vpce-[0-9a-z]+$"
+    Description: >
+      Optional. ID of an existing OpenSearch Serverless VPC endpoint (vpce-...) in this VPC.
+      Leave empty to create one. Reuse an existing one if the VPC already has an AOSS endpoint.
+
+  # ----- Networking (existing VPC + existing Bedrock endpoints) -----
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC for the Lambdas (DNS support + DNS hostnames enabled).
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more existing private subnets (different AZs) in that VPC.
+
+  BedrockEndpointSecurityGroupId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^sg-[0-9a-z]+$"
+    Description: >
+      Optional. Security group attached to your existing Bedrock VPC endpoints
+      (bedrock-agent, bedrock-agent-runtime). If set, the stack adds an HTTPS ingress rule
+      from the Lambda security group. Leave empty if they already allow HTTPS from these subnets.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [ProjectName, DocsPrefix]
+      - Label: { default: Networking (existing VPC and Bedrock endpoints) }
+        Parameters: [VpcId, SubnetIds, BedrockEndpointSecurityGroupId]
+      - Label: { default: OpenSearch Serverless }
+        Parameters: [AossStandbyReplicas, ExistingAossVpcEndpointId]
+      - Label: { default: Models & chunking }
+        Parameters: [EmbeddingModelId, EmbeddingDimensions, GenerationModelId, ChunkMaxTokens, ChunkOverlapPercentage, SyncBatchWindowSeconds]
+
+Conditions:
+  CreateAossVpcEndpoint: !Equals [!Ref ExistingAossVpcEndpointId, ""]
+  AddBedrockEndpointIngress: !Not [!Equals [!Ref BedrockEndpointSecurityGroupId, ""]]
+
+Mappings:
+  Aoss:
+    Names:
+      VectorIndex: bedrock-kb-index
+      VectorField: bedrock-knowledge-base-default-vector
+      TextField: AMAZON_BEDROCK_TEXT_CHUNK
+      MetadataField: AMAZON_BEDROCK_METADATA
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Network: security groups in the existing VPC
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: KB PoC Lambdas - HTTPS egress only (Bedrock + AOSS via VPC endpoints)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to VPC endpoints
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-lambda-sg" }]
+
+  # Let the Lambdas reach your EXISTING Bedrock interface endpoints
+  BedrockEndpointIngressFromLambdas:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: AddBedrockEndpointIngress
+    Properties:
+      GroupId: !Ref BedrockEndpointSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: !Sub "HTTPS from ${ProjectName} Lambdas"
+
+  AossEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateAossVpcEndpoint
+    Properties:
+      GroupDescription: OpenSearch Serverless VPC endpoint - HTTPS from KB PoC Lambdas only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from Lambdas
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: No egress needed
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-aoss-endpoint-sg" }]
+
+  # AOSS uses its own endpoint type (not a regular EC2 interface endpoint).
+  AossVpcEndpoint:
+    Type: AWS::OpenSearchServerless::VpcEndpoint
+    Condition: CreateAossVpcEndpoint
+    Properties:
+      Name: !Sub "${ProjectName}-aoss-vpce"
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref AossEndpointSecurityGroup]
+
+  # ---------------------------------------------------------------------------
+  # Source documents
+  # ---------------------------------------------------------------------------
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-docs-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  DocsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DocsBucket.Arn
+              - !Sub "${DocsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # IAM roles that need AOSS data access (referenced by the data access policy)
+  # ---------------------------------------------------------------------------
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-kb-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: kb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EmbeddingModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+              - Sid: ReadDocsList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DocsBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: ReadDocs
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DocsBucket.Arn}/${DocsPrefix}*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: VectorStore
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+
+  IndexCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: aoss
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub "arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+
+  # ---------------------------------------------------------------------------
+  # Vector store: private OpenSearch Serverless collection
+  # ---------------------------------------------------------------------------
+  AossEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-enc"
+      Type: encryption
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"]}],
+         "AWSOwnedKey":true}
+
+  # Private: reachable only through the AOSS VPC endpoint and by the Bedrock service.
+  AossNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-net"
+      Type: network
+      Policy: !Sub
+        - >-
+          [{"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"]}],
+            "AllowFromPublic":false,
+            "SourceVPCEs":["${VpceId}"],
+            "SourceServices":["bedrock.amazonaws.com"]}]
+        - VpceId: !If [CreateAossVpcEndpoint, !Ref AossVpcEndpoint, !Ref ExistingAossVpcEndpointId]
+
+  AossDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-access"
+      Type: data
+      Policy: !Sub >-
+        [{"Rules":[
+            {"ResourceType":"collection","Resource":["collection/${ProjectName}-vectors"],
+             "Permission":["aoss:DescribeCollectionItems","aoss:CreateCollectionItems","aoss:UpdateCollectionItems"]},
+            {"ResourceType":"index","Resource":["index/${ProjectName}-vectors/*"],
+             "Permission":["aoss:CreateIndex","aoss:DescribeIndex","aoss:UpdateIndex","aoss:DeleteIndex",
+                           "aoss:ReadDocument","aoss:WriteDocument"]}],
+          "Principal":["${KnowledgeBaseRole.Arn}","${IndexCreatorRole.Arn}"]}]
+
+  VectorCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: [AossEncryptionPolicy, AossNetworkPolicy]
+    Properties:
+      Name: !Sub "${ProjectName}-vectors"
+      Type: VECTORSEARCH
+      StandbyReplicas: !Ref AossStandbyReplicas
+      Description: Vector store for the Bedrock KB PoC
+
+  # ---------------------------------------------------------------------------
+  # Vector index creation.
+  # A private collection is only reachable from inside the VPC, so the index is created by
+  # an in-VPC Lambda. A small non-VPC provider Lambda invokes it and replies to CloudFormation
+  # (the in-VPC Lambda has no route to CloudFormation's S3 response URL without NAT).
+  # ---------------------------------------------------------------------------
+  IndexCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-aoss-index-creator"
+      Description: Creates the Bedrock KB vector index in the private AOSS collection (runs in VPC)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt IndexCreatorRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: !Ref SubnetIds
+      Code:
+        ZipFile: |
+          import hashlib, json, os, time, urllib.request, urllib.error
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          SESSION = boto3.Session()
+          REGION = os.environ["AWS_REGION"]
+
+          def signed(method, url, body=None):
+              data = json.dumps(body).encode() if body is not None else b""
+              req = AWSRequest(method=method, url=url, data=data,
+                               headers={"Content-Type": "application/json",
+                                        "x-amz-content-sha256": hashlib.sha256(data).hexdigest()})
+              SigV4Auth(SESSION.get_credentials(), "aoss", REGION).add_auth(req)
+              r = urllib.request.Request(url, data=data or None, method=method,
+                                         headers=dict(req.headers.items()))
+              try:
+                  with urllib.request.urlopen(r, timeout=30) as resp:
+                      return resp.status, resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()
+
+          def handler(event, context):
+              endpoint, index = event["CollectionEndpoint"].rstrip("/"), event["IndexName"]
+              dim = int(event["Dimension"])
+              body = {
+                  "settings": {"index": {"knn": True, "knn.algo_param.ef_search": 512}},
+                  "mappings": {"properties": {
+                      event["VectorField"]: {
+                          "type": "knn_vector", "dimension": dim,
+                          "method": {"name": "hnsw", "engine": "faiss", "space_type": "l2",
+                                     "parameters": {"ef_construction": 512, "m": 16}}},
+                      event["TextField"]: {"type": "text", "index": True},
+                      event["MetadataField"]: {"type": "text", "index": False},
+                  }},
+              }
+              # Data access + network policies can take a minute or two to propagate.
+              last = None
+              for attempt in range(20):
+                  status, text = signed("PUT", f"{endpoint}/{index}", body)
+                  print(json.dumps({"attempt": attempt, "status": status, "body": text[:500]}))
+                  if status in (200, 201):
+                      return {"created": True}
+                  if status == 400 and "resource_already_exists_exception" in text:
+                      return {"created": False, "exists": True}
+                  last = f"{status}: {text[:300]}"
+                  time.sleep(12)
+              raise RuntimeError(f"Could not create index {index}: {last}")
+
+  IndexProviderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: invoke-creator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt IndexCreatorFunction.Arn
+
+  IndexProviderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-aoss-index-provider"
+      Description: CloudFormation custom resource provider - invokes the in-VPC index creator
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 128
+      Role: !GetAtt IndexProviderRole.Arn
+      Environment:
+        Variables:
+          CREATOR_FN: !Ref IndexCreatorFunction
+      Code:
+        ZipFile: |
+          import json, os, time, boto3, cfnresponse
+          lam = boto3.client("lambda")
+
+          def handler(event, context):
+              props = event["ResourceProperties"]
+              phys = f"{props['CollectionName']}/{props['IndexName']}"
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      resp = lam.invoke(FunctionName=os.environ["CREATOR_FN"],
+                                        InvocationType="RequestResponse",
+                                        Payload=json.dumps(props).encode())
+                      payload = resp["Payload"].read().decode()
+                      if resp.get("FunctionError"):
+                          raise RuntimeError(payload[:800])
+                      print(payload)
+                      # Give the new index time to become visible before Bedrock validates it.
+                      if json.loads(payload).get("created"):
+                          time.sleep(60)
+                  # Delete: no-op - the index is removed together with the collection.
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"IndexName": props["IndexName"]}, phys)
+              except Exception as e:
+                  print(f"ERROR: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, phys, reason=str(e)[:500])
+
+  VectorIndex:
+    Type: Custom::AossVectorIndex
+    DependsOn: [AossDataAccessPolicy, AossNetworkPolicy]
+    Properties:
+      ServiceToken: !GetAtt IndexProviderFunction.Arn
+      CollectionName: !Ref VectorCollection
+      CollectionEndpoint: !GetAtt VectorCollection.CollectionEndpoint
+      IndexName: !FindInMap [Aoss, Names, VectorIndex]
+      Dimension: !Ref EmbeddingDimensions
+      VectorField: !FindInMap [Aoss, Names, VectorField]
+      TextField: !FindInMap [Aoss, Names, TextField]
+      MetadataField: !FindInMap [Aoss, Names, MetadataField]
+
+  # ---------------------------------------------------------------------------
+  # Knowledge Base
+  # ---------------------------------------------------------------------------
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: [VectorIndex, AossDataAccessPolicy]
+    Properties:
+      Name: !Sub "${ProjectName}-kb"
+      Description: PoC knowledge base over S3 documents (OpenSearch Serverless vector store)
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: !Ref EmbeddingDimensions
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt VectorCollection.Arn
+          VectorIndexName: !FindInMap [Aoss, Names, VectorIndex]
+          FieldMapping:
+            VectorField: !FindInMap [Aoss, Names, VectorField]
+            TextField: !FindInMap [Aoss, Names, TextField]
+            MetadataField: !FindInMap [Aoss, Names, MetadataField]
+
+  DocsDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub "${ProjectName}-s3-docs"
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataDeletionPolicy: RETAIN   # collection is deleted with the stack anyway; avoids delete-order failures
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocsBucket.Arn
+          InclusionPrefixes:
+            - !Ref DocsPrefix
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: !Ref ChunkMaxTokens
+            OverlapPercentage: !Ref ChunkOverlapPercentage
+
+  # ---------------------------------------------------------------------------
+  # Automatic sync: S3 events -> EventBridge -> SQS (batch/debounce) -> Lambda
+  # ---------------------------------------------------------------------------
+  SyncDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-sync-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  SyncQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-sync"
+      # If a job is already running the batch is retried after this visibility timeout.
+      VisibilityTimeout: 300
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SyncDLQ.Arn
+        maxReceiveCount: 30
+
+  SyncQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref SyncQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SyncQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt DocsChangedRule.Arn
+
+  DocsChangedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-docs-changed"
+      Description: Forward document create/delete events under the KB prefix to the sync queue
+      EventPattern:
+        source: [aws.s3]
+        detail-type: ["Object Created", "Object Deleted"]
+        detail:
+          bucket:
+            name: [!Ref DocsBucket]
+          object:
+            key: [{ prefix: !Ref DocsPrefix }]
+      Targets:
+        - Id: sync-queue
+          Arn: !GetAtt SyncQueue.Arn
+
+  SyncFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: sync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                  - bedrock:ListIngestionJobs
+                  - bedrock:GetIngestionJob
+                Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SyncQueue.Arn
+
+  SyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-kb-sync"
+      Description: Starts a Bedrock KB ingestion job when documents change (one job at a time)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt SyncFunctionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          KB_ID: !Ref KnowledgeBase
+          DS_ID: !GetAtt DocsDataSource.DataSourceId
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          from botocore.exceptions import ClientError
+
+          agent = boto3.client("bedrock-agent")
+          KB_ID, DS_ID = os.environ["KB_ID"], os.environ["DS_ID"]
+          BUSY = {"STARTING", "IN_PROGRESS", "STOPPING"}
+
+          class JobAlreadyRunning(Exception):
+              pass
+
+          def running_job():
+              resp = agent.list_ingestion_jobs(
+                  knowledgeBaseId=KB_ID, dataSourceId=DS_ID,
+                  sortBy={"attribute": "STARTED_AT", "order": "DESCENDING"}, maxResults=5)
+              for j in resp.get("ingestionJobSummaries", []):
+                  if j["status"] in BUSY:
+                      return j["ingestionJobId"]
+              return None
+
+          def handler(event, context):
+              keys = []
+              for r in event.get("Records", []):
+                  try:
+                      keys.append(json.loads(r["body"])["detail"]["object"]["key"])
+                  except Exception:
+                      pass
+              print(json.dumps({"changed_objects": len(keys), "sample": keys[:10]}))
+
+              job = running_job()
+              if job:
+                  # Fail the batch -> SQS redelivers after the visibility timeout.
+                  raise JobAlreadyRunning(f"Ingestion job {job} still running; will retry")
+              try:
+                  resp = agent.start_ingestion_job(
+                      knowledgeBaseId=KB_ID, dataSourceId=DS_ID,
+                      description=f"Auto-sync for {len(keys)} changed object(s)")
+              except ClientError as e:
+                  if e.response["Error"]["Code"] in ("ConflictException", "ThrottlingException"):
+                      raise JobAlreadyRunning(str(e))
+                  raise
+              job_id = resp["ingestionJob"]["ingestionJobId"]
+              print(json.dumps({"started_ingestion_job": job_id}))
+              return {"ingestionJobId": job_id}
+
+  SyncFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-kb-sync"
+      RetentionInDays: 14
+
+  SyncEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SyncQueue.Arn
+      FunctionName: !Ref SyncFunction
+      BatchSize: 1000
+      MaximumBatchingWindowInSeconds: !Ref SyncBatchWindowSeconds
+      ScalingConfig:
+        MaximumConcurrency: 2
+
+  # ---------------------------------------------------------------------------
+  # Query function (RAG)
+  # ---------------------------------------------------------------------------
+  QueryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: rag
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Retrieve
+                Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+              - Sid: RetrieveAndGenerate
+                Effect: Allow
+                Action: bedrock:RetrieveAndGenerate
+                Resource: "*"
+              - Sid: GenerationModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:GetInferenceProfile
+                Resource:
+                  # Cross-region inference profiles route to the foundation model in several regions.
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+
+  QueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-kb-query"
+      Description: RAG query over the Bedrock Knowledge Base
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt QueryFunctionRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          KB_ID: !Ref KnowledgeBase
+          MODEL_ID: !Ref GenerationModelId
+          ACCOUNT_ID: !Ref AWS::AccountId
+      Code:
+        ZipFile: |
+          import os, json, re, boto3
+
+          rt = boto3.client("bedrock-agent-runtime")
+          KB_ID, MODEL_ID = os.environ["KB_ID"], os.environ["MODEL_ID"]
+          REGION, ACCOUNT = os.environ["AWS_REGION"], os.environ["ACCOUNT_ID"]
+
+          # Inference profile IDs start with a geo prefix (us., eu., apac., global., ...)
+          if re.match(r"^[a-z]{2,6}\.", MODEL_ID) and not MODEL_ID.startswith(("amazon.", "anthropic.", "cohere.", "meta.", "mistral.")):
+              MODEL_ARN = f"arn:aws:bedrock:{REGION}:{ACCOUNT}:inference-profile/{MODEL_ID}"
+          else:
+              MODEL_ARN = f"arn:aws:bedrock:{REGION}::foundation-model/{MODEL_ID}"
+
+          PROMPT = (
+              "You are a helpful assistant. Answer the user's question using ONLY the search results below. "
+              "If the answer is not in the results, say you don't know. Be concise.\n\n"
+              "Search results:\n$search_results$\n\n$output_format_instructions$"
+          )
+
+          def handler(event, context):
+              # Accept direct invoke ({"question": ...}) or a Function URL / API GW body.
+              if isinstance(event.get("body"), str):
+                  event = json.loads(event["body"])
+              q = event["question"]
+              mode = event.get("mode", "rag")                     # "rag" | "retrieve"
+              vcfg = {
+                  "numberOfResults": int(event.get("numberOfResults", 5)),
+                  "overrideSearchType": event.get("searchType", "HYBRID"),   # HYBRID | SEMANTIC
+              }
+              if event.get("filter"):                             # Bedrock RetrievalFilter JSON
+                  vcfg["filter"] = event["filter"]
+
+              if mode == "retrieve":
+                  resp = rt.retrieve(knowledgeBaseId=KB_ID,
+                                     retrievalQuery={"text": q},
+                                     retrievalConfiguration={"vectorSearchConfiguration": vcfg})
+                  return {"results": [{
+                      "score": r.get("score"),
+                      "source": r["location"].get("s3Location", {}).get("uri"),
+                      "metadata": r.get("metadata"),
+                      "text": r["content"]["text"]} for r in resp["retrievalResults"]]}
+
+              args = {
+                  "input": {"text": q},
+                  "retrieveAndGenerateConfiguration": {
+                      "type": "KNOWLEDGE_BASE",
+                      "knowledgeBaseConfiguration": {
+                          "knowledgeBaseId": KB_ID,
+                          "modelArn": MODEL_ARN,
+                          "retrievalConfiguration": {"vectorSearchConfiguration": vcfg},
+                          "generationConfiguration": {"promptTemplate": {"textPromptTemplate": PROMPT}},
+                      },
+                  },
+              }
+              if event.get("sessionId"):
+                  args["sessionId"] = event["sessionId"]
+              resp = rt.retrieve_and_generate(**args)
+
+              sources = []
+              for c in resp.get("citations", []):
+                  for ref in c.get("retrievedReferences", []):
+                      uri = ref["location"].get("s3Location", {}).get("uri")
+                      if uri and uri not in sources:
+                          sources.append(uri)
+              return {"answer": resp["output"]["text"], "sources": sources, "sessionId": resp["sessionId"]}
+
+  QueryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-kb-query"
+      RetentionInDays: 14
+
+Outputs:
+  DocsBucketName:
+    Value: !Ref DocsBucket
+    Description: Upload documents (and optional .metadata.json sidecars) under DocsPrefix
+  DocsPrefix:
+    Value: !Ref DocsPrefix
+  KnowledgeBaseId:
+    Value: !Ref KnowledgeBase
+  DataSourceId:
+    Value: !GetAtt DocsDataSource.DataSourceId
+  QueryFunctionName:
+    Value: !Ref QueryFunction
+  SyncFunctionName:
+    Value: !Ref SyncFunction
+  CollectionArn:
+    Value: !GetAtt VectorCollection.Arn
+  CollectionEndpoint:
+    Value: !GetAtt VectorCollection.CollectionEndpoint
+  AossVpcEndpointId:
+    Value: !If [CreateAossVpcEndpoint, !Ref AossVpcEndpoint, !Ref ExistingAossVpcEndpointId]
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Description: Allow HTTPS from this SG on your Bedrock (and existing AOSS) endpoint security groups
