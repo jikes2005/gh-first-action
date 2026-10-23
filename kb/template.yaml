@@ -116,6 +116,74 @@ Resources:
       Description: !Sub "HTTPS from ${ProjectName} Lambdas"
 
   # ---------------------------------------------------------------------------
+  # Customer-managed KMS key used by every resource that supports it
+  # ---------------------------------------------------------------------------
+  KmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} - Bedrock KB PoC (S3, S3 Vectors, KB ingestion, sessions, SQS, Lambda, Logs)"
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Account admins + IAM policies (roles below are granted access via their IAM policies)
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          # S3 Vectors background index maintenance
+          - Sid: AllowS3VectorsIndexing
+            Effect: Allow
+            Principal: { Service: indexing.s3vectors.amazonaws.com }
+            Action: kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/*"
+              ForAnyValue:StringEquals:
+                kms:EncryptionContextKeys: ["aws:s3vectors:arn", "aws:s3vectors:resource-id"]
+          # Bedrock encrypts RetrieveAndGenerate session context with this key
+          - Sid: AllowBedrockSessionEncryption
+            Effect: Allow
+            Principal: { Service: bedrock.amazonaws.com }
+            Action: [kms:GenerateDataKey, kms:Decrypt]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # EventBridge sends to the KMS-encrypted SQS queue
+          - Sid: AllowEventBridgeToEncryptedSqs
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: [kms:GenerateDataKey, kms:Decrypt]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # CloudWatch Logs encrypts this stack's Lambda log groups
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal: { Service: !Sub "logs.${AWS::Region}.amazonaws.com" }
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*"
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-kb"
+      TargetKeyId: !Ref KmsKey
+
+  # ---------------------------------------------------------------------------
   # Source documents
   # ---------------------------------------------------------------------------
   DocsBucket:
@@ -127,7 +195,9 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KmsKey.Arn
+            BucketKeyEnabled: true
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -157,6 +227,24 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: "false"
+          # Objects may only be written with SSE-KMS using this stack's key
+          # (uploads without an encryption header get it via default encryption).
+          - Sid: DenyNonKmsEncryption
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${DocsBucket.Arn}/*"
+            Condition:
+              StringNotEqualsIfExists:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyOtherKmsKeys
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${DocsBucket.Arn}/*"
+            Condition:
+              StringNotEqualsIfExists:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt KmsKey.Arn
 
   # ---------------------------------------------------------------------------
   # Vector store (Amazon S3 Vectors)
@@ -165,6 +253,10 @@ Resources:
     Type: AWS::S3Vectors::VectorBucket
     Properties:
       VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
+      # Immutable after creation; inherited by the index.
+      EncryptionConfiguration:
+        SseType: aws:kms
+        KmsKeyArn: !GetAtt KmsKey.Arn
 
   VectorIndex:
     Type: AWS::S3Vectors::Index
@@ -224,6 +316,11 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceAccount: !Ref AWS::AccountId
+              # Decrypt SSE-KMS docs, read/write KMS-encrypted vectors, encrypt transient ingestion data
+              - Sid: KmsForKnowledgeBase
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                Resource: !GetAtt KmsKey.Arn
               - Sid: VectorStore
                 Effect: Allow
                 Action:
@@ -260,6 +357,9 @@ Resources:
       Name: !Sub "${ProjectName}-s3-docs"
       KnowledgeBaseId: !Ref KnowledgeBase
       DataDeletionPolicy: DELETE
+      # Encrypts transient data while documents are parsed/chunked/embedded
+      ServerSideEncryptionConfiguration:
+        KmsKeyArn: !GetAtt KmsKey.Arn
       DataSourceConfiguration:
         Type: S3
         S3Configuration:
@@ -281,7 +381,8 @@ Resources:
     Properties:
       QueueName: !Sub "${ProjectName}-sync-dlq"
       MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !GetAtt KmsKey.Arn
+      KmsDataKeyReusePeriodSeconds: 3600
 
   SyncQueue:
     Type: AWS::SQS::Queue
@@ -289,7 +390,8 @@ Resources:
       QueueName: !Sub "${ProjectName}-sync"
       # If a job is already running the batch is retried after this visibility timeout.
       VisibilityTimeout: 300
-      SqsManagedSseEnabled: true
+      KmsMasterKeyId: !GetAtt KmsKey.Arn
+      KmsDataKeyReusePeriodSeconds: 3600
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDLQ.Arn
         maxReceiveCount: 30
@@ -355,9 +457,14 @@ Resources:
                   - sqs:DeleteMessage
                   - sqs:GetQueueAttributes
                 Resource: !GetAtt SyncQueue.Arn
+              - Sid: KmsDecrypt
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt KmsKey.Arn
 
   SyncFunction:
     Type: AWS::Lambda::Function
+    DependsOn: SyncFunctionLogGroup
     Properties:
       FunctionName: !Sub "${ProjectName}-kb-sync"
       Description: Starts a Bedrock KB ingestion job when documents change (one job at a time)
@@ -367,6 +474,7 @@ Resources:
       MemorySize: 256
       ReservedConcurrentExecutions: 1
       Role: !GetAtt SyncFunctionRole.Arn
+      KmsKeyArn: !GetAtt KmsKey.Arn
       VpcConfig:
         SecurityGroupIds: [!Ref LambdaSecurityGroup]
         SubnetIds: !Ref SubnetIds
@@ -425,6 +533,7 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-kb-sync"
       RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
 
   SyncEventSource:
     Type: AWS::Lambda::EventSourceMapping
@@ -473,9 +582,14 @@ Resources:
                   # Cross-region inference profiles route to the foundation model in several regions.
                   - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
                   - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: KmsDecrypt
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt KmsKey.Arn
 
   QueryFunction:
     Type: AWS::Lambda::Function
+    DependsOn: QueryFunctionLogGroup
     Properties:
       FunctionName: !Sub "${ProjectName}-kb-query"
       Description: RAG query over the Bedrock Knowledge Base
@@ -484,6 +598,7 @@ Resources:
       Timeout: 120
       MemorySize: 512
       Role: !GetAtt QueryFunctionRole.Arn
+      KmsKeyArn: !GetAtt KmsKey.Arn
       VpcConfig:
         SecurityGroupIds: [!Ref LambdaSecurityGroup]
         SubnetIds: !Ref SubnetIds
@@ -492,6 +607,7 @@ Resources:
           KB_ID: !Ref KnowledgeBase
           MODEL_ID: !Ref GenerationModelId
           ACCOUNT_ID: !Ref AWS::AccountId
+          SESSION_KMS_KEY_ARN: !GetAtt KmsKey.Arn
       Code:
         ZipFile: |
           import os, json, re, boto3
@@ -547,6 +663,10 @@ Resources:
               }
               if event.get("sessionId"):
                   args["sessionId"] = event["sessionId"]
+              else:
+                  # Session context (conversation memory) stored by Bedrock is encrypted with the CMK.
+                  # Only allowed when creating a new session.
+                  args["sessionConfiguration"] = {"kmsKeyArn": os.environ["SESSION_KMS_KEY_ARN"]}
               resp = rt.retrieve_and_generate(**args)
 
               sources = []
@@ -562,6 +682,7 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-kb-query"
       RetentionInDays: 14
+      KmsKeyId: !GetAtt KmsKey.Arn
 
 Outputs:
   DocsBucketName:
@@ -579,6 +700,9 @@ Outputs:
     Value: !Ref SyncFunction
   VectorIndexArn:
     Value: !Ref VectorIndex
+  KmsKeyArn:
+    Value: !GetAtt KmsKey.Arn
+    Description: Uploaders need kms:GenerateDataKey on this key to put objects in the docs bucket
   LambdaSecurityGroupId:
     Value: !Ref LambdaSecurityGroup
     Description: Allow HTTPS from this SG on your Bedrock endpoint security group

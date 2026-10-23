@@ -21,7 +21,8 @@ EventBridge rule ──▶ SQS queue (batching, retries, DLQ)
 
 | Resource | Purpose |
 |---|---|
-| `DocsBucket` | Source documents. Versioned, encrypted, public access blocked, TLS-only, EventBridge notifications on. |
+| `KmsKey` + `alias/<ProjectName>-kb` | Customer-managed KMS key with automatic rotation, used by every resource below that supports KMS. See [Encryption](#encryption-kms). |
+| `DocsBucket` | Source documents. SSE-KMS with an S3 Bucket Key, versioned, public access blocked, TLS-only, EventBridge notifications on. |
 | `VectorBucket` + `VectorIndex` | S3 Vectors store (cosine distance, 1024 dimensions). Bedrock requires `AMAZON_BEDROCK_TEXT` and `AMAZON_BEDROCK_METADATA` to be non-filterable. |
 | `KnowledgeBase` + `KnowledgeBaseRole` | Bedrock KB using Titan Text Embeddings V2. The role is scoped to the docs prefix, the vector index and the embedding model. |
 | `DocsDataSource` | S3 data source over `kb/` with fixed-size chunking (400 tokens, 15% overlap). |
@@ -40,6 +41,47 @@ EventBridge rule ──▶ SQS queue (batching, retries, DLQ)
 - The KB reads the docs bucket and reads/writes vectors from Bedrock's own infrastructure, using `KnowledgeBaseRole`.
 - Lambda polls SQS and ships logs through the Lambda service. That's why no SQS, Logs or S3 Vectors endpoints are needed.
 
+## Encryption (KMS)
+
+One customer-managed key (`KmsKey`, rotation enabled) encrypts everything that supports KMS:
+
+| Resource | How it's encrypted |
+|---|---|
+| Docs bucket (S3) | Default SSE-KMS with an S3 Bucket Key. The bucket policy **denies** uploads that request SSE-S3 or a different KMS key. |
+| S3 Vectors bucket + index | `EncryptionConfiguration: aws:kms`. Immutable after creation; the index inherits it. |
+| KB ingestion (transient data) | `ServerSideEncryptionConfiguration` on the data source encrypts temporary data while documents are parsed, chunked and embedded. |
+| `RetrieveAndGenerate` sessions | The query Lambda passes `sessionConfiguration.kmsKeyArn` when it starts a session, so the conversation context that Bedrock stores is encrypted with the key. |
+| SQS sync queue + DLQ | `KmsMasterKeyId`. EventBridge is allowed to encrypt messages through the key policy. |
+| Lambda environment variables | `KmsKeyArn` on both functions. |
+| CloudWatch log groups | `KmsKeyId` on both log groups. The log groups are created before the functions, so logs are never written unencrypted. |
+
+**Key policy grants (least privilege):**
+
+| Principal | Access | Scope |
+|---|---|---|
+| Account root | Delegates to IAM | Standard. Lets IAM policies grant use of the key. |
+| `indexing.s3vectors.amazonaws.com` | `kms:Decrypt` | Background index maintenance, limited to this account's vector buckets with S3 Vectors encryption context. |
+| `bedrock.amazonaws.com` | `GenerateDataKey`, `Decrypt` | Session encryption, limited to this account. |
+| `events.amazonaws.com` | `GenerateDataKey`, `Decrypt` | Writing to the encrypted queue, limited to this account. |
+| `logs.<region>.amazonaws.com` | Encrypt/decrypt | Only for `/aws/lambda/<ProjectName>-*` log groups, via encryption context. |
+
+The KB role and the Lambda roles get `kms:Decrypt` and `kms:GenerateDataKey` on this one key through their IAM policies.
+
+**What can't take a customer-managed key:**
+- **EventBridge rule:** events aren't stored; they're encrypted in transit.
+- **Bedrock KB control-plane resource:** for a KB with your own vector store, the vector data lives in S3 Vectors, which is encrypted.
+- **IAM and security groups:** these hold no data.
+
+**No KMS VPC endpoint is needed.** The Lambdas never call KMS directly. Environment variables are decrypted by the Lambda service, and session encryption is done by Bedrock.
+
+**Who uploads documents:** any IAM principal uploading to the docs bucket needs `kms:GenerateDataKey` on the key. Readers need `kms:Decrypt`. Admins in the account typically already have this. The key ARN is the `KmsKeyArn` stack output.
+
+**Key retention:** the key has `DeletionPolicy: Retain`, so deleting the stack doesn't destroy it. This prevents locking yourself out of any data or backups that are still encrypted with it. After tear-down, schedule deletion manually if you no longer need it:
+
+```bash
+aws kms schedule-key-deletion --key-id <KmsKeyArn> --pending-window-in-days 7
+```
+
 ## Prerequisites
 
 1. **Region.** Use one where Bedrock Knowledge Bases, S3 Vectors and your models are available. `us-east-1` and `us-west-2` are safe defaults. If you need `ca-central-1`, check availability first.
@@ -50,7 +92,7 @@ EventBridge rule ──▶ SQS queue (batching, retries, DLQ)
    - `com.amazonaws.<region>.bedrock-agent-runtime`, used by the query Lambda.
 
    Their security group must allow 443 from the Lambdas. Pass that group as `BedrockEndpointSecurityGroupId` and the stack adds the rule, or allow the `LambdaSecurityGroupId` output yourself.
-5. **IAM.** AWS CLI v2 with permission to create IAM roles (`CAPABILITY_NAMED_IAM`).
+5. **IAM.** AWS CLI v2 with permission to create IAM roles (`CAPABILITY_NAMED_IAM`) and KMS keys. The deploying principal also needs `kms:GenerateDataKey` and `kms:Decrypt` on the new key to create the encrypted vector bucket. Account admins get this through the key policy's root statement.
 
 ## Deploy
 
@@ -127,6 +169,9 @@ S3 Vectors has **no minimum charge**. You pay for vector storage, writes and que
 | Sync or query Lambda times out | The Bedrock VPC endpoint isn't reachable. Check its security group allows 443 from `LambdaSecurityGroupId` and that private DNS is enabled. |
 | Ingestion job `FAILED` | `aws bedrock-agent get-ingestion-job ...` → `failureReasons`. |
 | `AccessDeniedException` on query | Model access isn't enabled, or the inference profile ID is wrong for the region. |
+| Upload fails with `AccessDenied` (KMS) | Your principal needs `kms:GenerateDataKey` on `KmsKeyArn`. Also don't pass `--sse AES256` or a different `--sse-kms-key-id`, because the bucket policy denies those. |
+| Ingestion job fails with a KMS error | The KB role is missing permission on the key, or the key is disabled or pending deletion. |
+| `ValidationException` about `sessionConfiguration` | The key can only be set when a session starts. The query Lambda sends it only when no `sessionId` is passed. |
 
 ## Clean up
 
@@ -138,11 +183,11 @@ aws s3api delete-objects --bucket <DocsBucketName> \
 aws cloudformation delete-stack --stack-name kb-poc
 ```
 
-Deletion can take 10–20 minutes while AWS releases the VPC Lambdas' network interfaces.
+Deletion can take 10–20 minutes while AWS releases the VPC Lambdas' network interfaces. The KMS key is **retained**; see [Key retention](#encryption-kms) above to schedule its deletion.
 
 ## PoC simplifications → production next steps
 
-- **Encryption:** use a customer-managed KMS key for the docs bucket, the vector index (`EncryptionConfiguration`), SQS and the KB.
+- **Key management:** if your organization uses centrally managed keys, replace `KmsKey` with an existing key ARN parameter. The key policy statements above must then be added to that key by its owners.
 - **API front door:** add API Gateway with a private REST API through an `execute-api` endpoint, or IAM auth, in front of the query Lambda.
 - **Access control:** derive `filter` from the caller's identity (for example `tenant_id`), never from request input.
 - **Guardrails:** add an `AWS::Bedrock::Guardrail` and pass `guardrailConfiguration` in `RetrieveAndGenerate`.
